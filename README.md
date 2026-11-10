@@ -37,7 +37,7 @@ a28a1a84526d81b3d7f5cd679869449b    beatles/dont_ever_change.mid
 ```
 
 ### 3. Playback Script (`playmidi.sh`)
-Create a file named `playmidi.sh` in the same directory, make it executable (`chmod +x playmidi.sh`), and define your preferred playback command. For example:
+Create a file named `playmidi.sh` in the directory you start the program from (or anywhere in your `$PATH`), make it executable (`chmod +x playmidi.sh`), and define your preferred playback command. A `./playmidi.sh` in the current directory takes precedence over one in `$PATH`. The script runs in its own process group, so stopping playback also stops a player the script starts without `exec`. For example:
 
 ```bash
 #!/bin/bash
