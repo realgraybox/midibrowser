@@ -13,14 +13,17 @@
 #include <signal.h>
 #include <errno.h>
 
+// One record = one line of the database file, stored once. The delimiters are
+// replaced by '\0', so column k is found by skipping k-1 strings.
 typedef struct {
-    char md5[33];
-    char *paths;            // heap-allocated, exact length
-} MidiEntry;
+    char *line;
+    int nfields;
+} Entry;
 
-static MidiEntry *database = NULL;
+static Entry *database = NULL;
 static int db_count = 0;
 static int db_capacity = 0;
+static int db_max_fields = 0;
 
 static int *filtered_indices = NULL;
 static int filtered_count = 0;
@@ -39,6 +42,22 @@ static int font_loaded = 0;     // 1 = XLoadQueryFont (XFreeFont), 0 = XQueryFon
 // PID (and process group id) of the running player, 0 if none.
 // Written from the SIGCHLD handler, hence volatile.
 static volatile pid_t current_player_pid = 0;
+
+// ---------------------------------------------------------------------------
+// Command line options (see usage())
+// ---------------------------------------------------------------------------
+#define MAX_COLS 32
+static const char *opt_file      = "midi_database_kompakt.txt";   // -f
+static char        opt_delim     = '\t';                          // -d
+static int         opt_search[MAX_COLS] = { 2 };                   // -s
+static int         opt_nsearch   = 1;
+static const char *opt_show      = "[{1:1}/{1}] {2}";              // -c
+static const char *opt_arg       = NULL;                           // -p (NULL = MIDI md5 layout)
+static const char *opt_cmd       = NULL;                           // -x (NULL = playmidi.sh)
+static const char *opt_title     = "MIDI DB Browser";              // -T
+static const char *opt_action    = "Play";                         // -a
+static int         opt_keep      = 0;                              // -k
+static char        show_buf[MAX_COLS * 8];   // template built from "-c 2,1"
 
 // configuration and style
 static int win_width = 800;
@@ -211,10 +230,56 @@ static int contains_folded(const char *hay, const char *needle, int needle_ascii
     return 0;
 }
 
+// Column 'col' (1-based) of an entry; "" if the line has fewer columns.
+static const char *field(const Entry *e, int col) {
+    if (col < 1 || col > e->nfields) return "";
+    const char *f = e->line;
+    while (--col > 0) f += strlen(f) + 1;
+    return f;
+}
+
+// Expand a template such as "[{1:1}/{1}] {2}" for one entry.
+// {N} is column N, {N:K} its first K characters. Anything else is copied as is.
+// The result lives in a buffer owned by the caller (*buf, *cap), reused between calls.
+static const char *expand(const char *tpl, const Entry *e, char **buf, size_t *cap) {
+    size_t len = 0;
+    const char *t = tpl;
+    while (*t) {
+        const char *src = t;
+        size_t n = 1;
+        if (*t == '{' && t[1] >= '1' && t[1] <= '9') {
+            char *end;
+            long col = strtol(t + 1, &end, 10);
+            long chars = -1;
+            if (*end == ':') chars = strtol(end + 1, &end, 10);
+            if (*end == '}' && chars != 0) {
+                src = field(e, (int)col);
+                n = strlen(src);
+                if (chars > 0) {    // first 'chars' UTF-8 characters
+                    const unsigned char *q = (const unsigned char *)src;
+                    while (*q && chars-- > 0) utf8_next(&q);
+                    n = (size_t)((const char *)q - src);
+                }
+                t = end + 1;
+            } else t++;
+        } else t++;
+
+        if (len + n + 1 > *cap) {
+            *cap = (len + n + 1) * 2;
+            *buf = xrealloc(*buf, *cap);
+        }
+        memcpy(*buf + len, src, n);
+        len += n;
+    }
+    if (!*buf) *buf = xrealloc(NULL, *cap = 64);
+    (*buf)[len] = '\0';
+    return *buf;
+}
+
 static void load_database(void) {
-    FILE *fp = fopen("midi_database_kompakt.txt", "r");
+    FILE *fp = strcmp(opt_file, "-") ? fopen(opt_file, "r") : stdin;
     if (!fp) {
-        perror("Could not open database \"midi_database_kompakt.txt\"");
+        fprintf(stderr, "Could not open database \"%s\": %s\n", opt_file, strerror(errno));
         exit(1);
     }
 
@@ -224,26 +289,28 @@ static void load_database(void) {
     ssize_t n;
     while ((n = getline(&line, &cap, fp)) != -1) {
         while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
-
-        char *tab = strchr(line, '\t');
-        if (!tab || tab == line) continue;   // need a non-empty key before the tab
-        *tab = '\0';
+        if (n == 0) continue;   // skip empty lines
 
         if (db_count == db_capacity) {
             db_capacity = db_capacity ? db_capacity * 2 : 4096;
             database = xrealloc(database, (size_t)db_capacity * sizeof(*database));
         }
-        MidiEntry *e = &database[db_count];
-        snprintf(e->md5, sizeof(e->md5), "%s", line);
-        e->paths = dup_as_utf8(tab + 1);
-        if (!e->paths) {
+        Entry *e = &database[db_count];
+        e->line = dup_as_utf8(line);
+        if (!e->line) {
             perror("Out of memory");
             exit(1);
         }
+        // Split into columns in place.
+        e->nfields = 1;
+        for (char *c = e->line; *c; c++) {
+            if (*c == opt_delim) { *c = '\0'; e->nfields++; }
+        }
+        if (e->nfields > db_max_fields) db_max_fields = e->nfields;
         db_count++;
     }
     free(line);
-    fclose(fp);
+    if (fp != stdin) fclose(fp);
 
     filtered_indices = xrealloc(NULL, (size_t)(db_count ? db_count : 1) * sizeof(int));
     printf("Read %d records in memory.\n", db_count);
@@ -287,19 +354,18 @@ static void update_filter(int narrow) {
     fold_string(needle);
     int ascii = is_ascii(needle);
 
-    if (narrow) {
-        int n = 0;
-        for (int k = 0; k < filtered_count; k++) {
-            int i = filtered_indices[k];
-            if (contains_folded(database[i].paths, needle, ascii)) filtered_indices[n++] = i;
-        }
-        filtered_count = n;
-    } else {
-        filtered_count = 0;
-        for (int i = 0; i < db_count; i++) {
-            if (contains_folded(database[i].paths, needle, ascii)) filtered_indices[filtered_count++] = i;
+    int count = narrow ? filtered_count : db_count;
+    int n = 0;
+    for (int k = 0; k < count; k++) {
+        int i = narrow ? filtered_indices[k] : k;
+        for (int c = 0; c < opt_nsearch; c++) {
+            if (contains_folded(field(&database[i], opt_search[c]), needle, ascii)) {
+                filtered_indices[n++] = i;
+                break;
+            }
         }
     }
+    filtered_count = n;
     // New result list: start at the top so the highlight is never off screen.
     selected_index = 0;
     scroll_offset = 0;
@@ -328,7 +394,7 @@ static void setup_signals(void) {
     sigaction(SIGCHLD, &sa, NULL);
 }
 
-static void stop_midi(void) {
+static void stop_player(void) {
     sigset_t block, old;
     sigemptyset(&block);
     sigaddset(&block, SIGCHLD);
@@ -337,7 +403,7 @@ static void stop_midi(void) {
     pid_t pid = current_player_pid;
     if (pid > 0) {
         // Negative pid = whole process group: also stops players started by a
-        // playmidi.sh that does not 'exec' its player.
+        // script that does not 'exec' its player.
         kill(-pid, SIGTERM);
         current_player_pid = 0;
     }
@@ -346,34 +412,8 @@ static void stop_midi(void) {
     // The child is reaped by the SIGCHLD handler, so no zombies are left behind.
 }
 
-static const char *player_command(void) {
-    // Prefer a playmidi.sh in the current directory (as documented in the README),
-    // otherwise fall back to a lookup in $PATH.
-    if (access("./playmidi.sh", X_OK) == 0) return "./playmidi.sh";
-    return "playmidi.sh";
-}
-
-static void play_midi(int index) {
-    if (index < 0 || index >= filtered_count) return;
-
-    stop_midi();
-
-    const MidiEntry *e = &database[filtered_indices[index]];
-    char md5_path[512];
-
-    snprintf(md5_path, sizeof(md5_path), "%c/%s.mid", e->md5[0], e->md5);
-    if (access(md5_path, F_OK) == -1) {
-        snprintf(md5_path, sizeof(md5_path), "%c/%s.midi", e->md5[0], e->md5);
-        if (access(md5_path, F_OK) == -1) {
-            snprintf(md5_path, sizeof(md5_path), "%c/%s", e->md5[0], e->md5);
-        }
-    }
-
-    printf("Playing: %s\n", e->paths);
-    fflush(stdout);
-
-    const char *cmd = player_command();
-
+// Run the configured command with 'arg' as its only argument.
+static void run_command(const char *arg) {
     // Block SIGCHLD until current_player_pid is set, so a player that exits
     // immediately is still recognised by the handler.
     sigset_t block, old;
@@ -383,19 +423,62 @@ static void play_midi(int index) {
 
     pid_t pid = fork();
     if (pid == 0) {
-        setpgid(0, 0);                       // own process group, see stop_midi()
+        setpgid(0, 0);                        // own process group, see stop_player()
         sigprocmask(SIG_SETMASK, &old, NULL); // signal mask survives exec: restore it
-        execlp(cmd, cmd, md5_path, (char *)NULL);
-        fprintf(stderr, "Could not run %s: %s\n", cmd, strerror(errno));
-        _exit(127);                          // _exit: don't flush the parent's stdio buffers
+        if (!opt_cmd) {
+            // Default: playmidi.sh in the current directory, otherwise from $PATH.
+            const char *cmd = access("./playmidi.sh", X_OK) == 0 ? "./playmidi.sh" : "playmidi.sh";
+            execlp(cmd, cmd, arg, (char *)NULL);
+            fprintf(stderr, "Could not run %s: %s\n", cmd, strerror(errno));
+        } else if (strpbrk(opt_cmd, " \t|;&<>()$`'\"")) {
+            // A command line with options, pipes etc.: let the shell run it.
+            // The value is passed as "$1", so it is never parsed by the shell.
+            size_t len = strlen(opt_cmd) + 8;
+            char *script = malloc(len);
+            if (script) {
+                snprintf(script, len, "%s \"$1\"", opt_cmd);
+                execl("/bin/sh", "sh", "-c", script, "sh", arg, (char *)NULL);
+            }
+            fprintf(stderr, "Could not run /bin/sh: %s\n", strerror(errno));
+        } else {
+            execlp(opt_cmd, opt_cmd, arg, (char *)NULL);
+            fprintf(stderr, "Could not run %s: %s\n", opt_cmd, strerror(errno));
+        }
+        _exit(127);                           // _exit: don't flush the parent's stdio buffers
     } else if (pid > 0) {
-        setpgid(pid, pid);                   // also in the parent, avoids a race with kill()
-        current_player_pid = pid;
+        setpgid(pid, pid);                    // also in the parent, avoids a race with kill()
+        if (!opt_keep) current_player_pid = pid;
     } else {
         perror("fork");
     }
 
     sigprocmask(SIG_SETMASK, &old, NULL);
+}
+
+static void activate(int index) {
+    static char *buf = NULL;
+    static size_t cap = 0;
+    if (index < 0 || index >= filtered_count) return;
+
+    if (!opt_keep) stop_player();
+
+    const Entry *e = &database[filtered_indices[index]];
+    const char *arg;
+
+    if (opt_arg) {
+        arg = expand(opt_arg, e, &buf, &cap);
+    } else {
+        // Default MIDI layout: <first char>/<key>.mid, .midi or no extension.
+        arg = expand("{1:1}/{1}.mid", e, &buf, &cap);
+        if (access(arg, F_OK) == -1) {
+            arg = expand("{1:1}/{1}.midi", e, &buf, &cap);
+            if (access(arg, F_OK) == -1) arg = expand("{1:1}/{1}", e, &buf, &cap);
+        }
+    }
+
+    printf("%s: %s\n", opt_action, arg);
+    fflush(stdout);
+    run_command(arg);
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +544,8 @@ static void draw_text_fit(Drawable d, int x, int y, const char *text, int max_wi
 }
 
 static void draw_ui(void) {
+    static char *row_buf = NULL;
+    static size_t row_cap = 0;
     if (!pixmap) return;
 
     int text_width = win_width - 2 * padding_left;
@@ -484,19 +569,9 @@ static void draw_ui(void) {
             XSetForeground(dpy, gc, col_mid_fg);
         }
 
-        const MidiEntry *e = &database[filtered_indices[current_idx]];
-        char prefix[48];
-        snprintf(prefix, sizeof(prefix), "[%c/%s] ", e->md5[0], e->md5);
-
-        // Draw "[x/md5] paths" without building a big temporary buffer.
-        int y_text = y_pos + padding_rows + font_ascent;
-        int prefix_w = XTextWidth(font_info, prefix, (int)strlen(prefix));
-        if (prefix_w >= text_width) {
-            draw_text_fit(pixmap, padding_left, y_text, prefix, text_width);
-        } else {
-            XDrawString(dpy, pixmap, gc, padding_left, y_text, prefix, (int)strlen(prefix));
-            draw_text_fit(pixmap, padding_left + prefix_w, y_text, e->paths, text_width - prefix_w);
-        }
+        const Entry *e = &database[filtered_indices[current_idx]];
+        draw_text_fit(pixmap, padding_left, y_pos + padding_rows + font_ascent,
+                      expand(opt_show, e, &row_buf, &row_cap), text_width);
     }
 
     // 2. Search bar (top)
@@ -514,8 +589,9 @@ static void draw_ui(void) {
     XSetForeground(dpy, gc, col_bot_fg);
     char status_text[256];
     snprintf(status_text, sizeof(status_text),
-             "Found: %d/%d  |  [Enter/Click]: Play  |  [Ctrl]: Stop Music  |  [ESC]: Quit",
-             filtered_count, db_count);
+             opt_keep ? "Found: %d/%d  |  [Enter/Click]: %s  |  [ESC]: Quit"
+                      : "Found: %d/%d  |  [Enter/Click]: %s  |  [Ctrl]: Stop  |  [ESC]: Quit",
+             filtered_count, db_count, opt_action);
     draw_text_fit(pixmap, padding_left, footer_y + padding_top_bottom_bars + font_ascent, status_text, text_width);
 
     // 4. Copy pixmap to the window
@@ -527,8 +603,93 @@ static void draw_ui(void) {
 // Main
 // ---------------------------------------------------------------------------
 
-int main(void) {
+static void usage(const char *prog) {
+    printf(
+"Usage: %s [options]\n"
+"\n"
+"  -f FILE      database file, '-' for standard input (default: midi_database_kompakt.txt)\n"
+"  -d CHAR      column delimiter, 'tab' or a single character (default: tab)\n"
+"  -s COLS      column(s) to search, e.g. 2 or 1,3 (default: 2)\n"
+"  -c COLS      column(s) to show, e.g. 2,1, or a template (default: '[{1:1}/{1}] {2}')\n"
+"  -p TEMPLATE  argument for the command, e.g. '{1}' or 'data/{2}.wav'\n"
+"               (default: MIDI layout {1:1}/{1}.mid, also .midi or no extension)\n"
+"  -x COMMAND   command to run; may include options, e.g. 'aplay -q'\n"
+"               (default: ./playmidi.sh, or playmidi.sh from $PATH)\n"
+"  -T TITLE     window title (default: MIDI DB Browser)\n"
+"  -a LABEL     action shown in the status bar and log (default: Play)\n"
+"  -k           keep programs running: don't stop the previous one, no Ctrl stop\n"
+"  -h           show this help\n"
+"\n"
+"Templates: {N} is column N, {N:K} its first K characters.\n"
+"A file with only one column is shown, searched and passed as is.\n", prog);
+}
+
+// Parse "2" or "1,3" into cols[]; returns the count, 0 on error.
+static int parse_cols(const char *s, int *cols) {
+    int n = 0;
+    while (*s) {
+        char *end;
+        long v = strtol(s, &end, 10);
+        if (end == s || v < 1 || v > 999 || n == MAX_COLS) return 0;
+        cols[n++] = (int)v;
+        if (*end == ',') end++;
+        else if (*end) return 0;
+        s = end;
+    }
+    return n;
+}
+
+int main(int argc, char **argv) {
+    int opt, given_s = 0, given_c = 0;
+    while ((opt = getopt(argc, argv, "f:d:s:c:p:x:T:a:kh")) != -1) {
+        switch (opt) {
+        case 'f': opt_file = optarg; break;
+        case 'd':
+            if (!strcmp(optarg, "tab") || !strcmp(optarg, "\\t")) opt_delim = '\t';
+            else if (strlen(optarg) == 1) opt_delim = optarg[0];
+            else { fprintf(stderr, "-d: give a single character or 'tab'\n"); return 2; }
+            break;
+        case 's':
+            opt_nsearch = parse_cols(optarg, opt_search);
+            if (!opt_nsearch) { fprintf(stderr, "-s: give column numbers like 2 or 1,3\n"); return 2; }
+            given_s = 1;
+            break;
+        case 'c':
+            if (strchr(optarg, '{')) {
+                opt_show = optarg;
+            } else {
+                int cols[MAX_COLS], n = parse_cols(optarg, cols);
+                if (!n) { fprintf(stderr, "-c: give column numbers like 2,1 or a template\n"); return 2; }
+                show_buf[0] = '\0';
+                for (int i = 0; i < n; i++) {
+                    size_t l = strlen(show_buf);
+                    snprintf(show_buf + l, sizeof(show_buf) - l, i ? "  {%d}" : "{%d}", cols[i]);
+                }
+                opt_show = show_buf;
+            }
+            given_c = 1;
+            break;
+        case 'p': opt_arg = optarg; break;
+        case 'x': opt_cmd = optarg; break;
+        case 'T': opt_title = optarg; break;
+        case 'a': opt_action = optarg; break;
+        case 'k': opt_keep = 1; break;
+        case 'h': usage(argv[0]); return 0;
+        default:  usage(argv[0]); return 2;
+        }
+    }
+    if (optind < argc) { usage(argv[0]); return 2; }
+
     load_database();
+
+    // A plain list (one column): show, search and pass the line itself,
+    // unless the options say otherwise.
+    if (db_max_fields == 1) {
+        if (!given_s) { opt_search[0] = 1; opt_nsearch = 1; }
+        if (!given_c) opt_show = "{1}";
+        if (!opt_arg) opt_arg = "{1}";
+    }
+
     update_filter(0);
     setup_signals();
 
@@ -553,7 +714,13 @@ int main(void) {
     Atom wm_delete_window = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete_window, 1);
 
-    XStoreName(dpy, win, "MIDI DB Browser");
+    // Title: XStoreName for old window managers, _NET_WM_NAME (UTF-8) for current ones.
+    XStoreName(dpy, win, opt_title);
+    XChangeProperty(dpy, win, XInternAtom(dpy, "_NET_WM_NAME", False),
+                    XInternAtom(dpy, "UTF8_STRING", False), 8, PropModeReplace,
+                    (const unsigned char *)opt_title, (int)strlen(opt_title));
+    XClassHint class_hint = { (char *)"midibrowser", (char *)"Midibrowser" };
+    XSetClassHint(dpy, win, &class_hint);
     XMapWindow(dpy, win);
 
     gc = XCreateGC(dpy, win, 0, NULL);
@@ -620,8 +787,10 @@ int main(void) {
             int len = (int)strlen(search_query);
 
             if (keysym == XK_Control_L || keysym == XK_Control_R) {
-                stop_midi();
-                printf("Music stopped via CTRL.\n");
+                if (!opt_keep && current_player_pid) {
+                    stop_player();
+                    printf("Stopped via CTRL.\n");
+                }
             }
             else if (keysym == XK_Escape) {
                 running = 0;
@@ -639,7 +808,7 @@ int main(void) {
             else if (keysym == XK_Return || keysym == XK_KP_Enter) {
                 ensure_visible();
                 draw_ui();
-                play_midi(selected_index);
+                activate(selected_index);
             }
             else if (keysym == XK_BackSpace) {
                 if (len > 0) {
@@ -689,7 +858,7 @@ int main(void) {
                     if (clicked_row < rows && target_idx < filtered_count) {
                         selected_index = target_idx;
                         draw_ui();
-                        play_midi(selected_index);
+                        activate(selected_index);
                     }
                 }
             }
@@ -710,7 +879,7 @@ int main(void) {
         }
     }
 
-    stop_midi();
+    if (!opt_keep) stop_player();
     if (pixmap) XFreePixmap(dpy, pixmap);
     if (font_loaded) XFreeFont(dpy, font_info);
     else XFreeFontInfo(NULL, font_info, 1);
@@ -718,7 +887,7 @@ int main(void) {
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
 
-    for (int i = 0; i < db_count; i++) free(database[i].paths);
+    for (int i = 0; i < db_count; i++) free(database[i].line);
     free(database);
     free(filtered_indices);
     return 0;
