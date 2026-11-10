@@ -11,6 +11,7 @@ This tool is designed to handle hundreds of thousands of entries with zero lag. 
 - **Double Buffering (Pixmap):** All drawing operations are performed off-screen first, ensuring a 100% flicker-free experience—even during window resizing.
 - **Dynamic UI Scaling:** The layout, bars, and click zones automatically adapt to the window dimensions and the system font (padding and spacing are calculated dynamically based on font metrics).
 - **Decoupled Player Control:** Forwards the selected file path to an external script (`playmidi.sh`), allowing you to easily swap playback engines (e.g., Timidity, aplaymidi) without recompiling the C binary.
+- **International Characters:** File names are UTF-8 (Latin-1 lines are converted when loading). You can type and search for letters such as æ, ø and å, case-insensitively (Æ finds æ). This uses only core X11 fonts, so no extra libraries are needed.
 - **Keyboard & Mouse Navigation:** Full support for arrow keys, mouse wheel scrolling, and instant selection via mouse clicks.
 
 ## 🛠 Prerequisites & Installation
@@ -92,7 +93,7 @@ exec timidity "$1"
 
 | Key / Action | Function |
 | :--- | :--- |
-| **Keyboard (Alphanumeric)** | Type in the top search bar to filter the database in real-time |
+| **Keyboard (letters, digits, æøå ...)** | Type in the top search bar to filter the database in real-time (case-insensitive) |
 | **BackSpace** | Delete characters in the search query |
 | **Arrow Up / Down** | Navigate up and down the filtered list |
 | **Enter** | Play the selected file (automatically terminates the previous playback) |
@@ -103,7 +104,9 @@ exec timidity "$1"
 
 ## 🎨 Customization
 
-Colors, paddings and the font name are variables at the top of `midibrowser.c`. Change them and recompile; the layout is calculated from the font's size at startup.
+Colors, paddings and the font list are variables at the top of `midibrowser.c`. Change them and recompile; the layout is calculated from the font's size at startup.
+
+By default the Unicode version of the classic `fixed` font is used (`-misc-fixed-...-iso10646-1`, from the `xfonts-base` package). If it isn't installed, the plain `fixed` font is used: letters from Western European languages (Latin-1) still display correctly, and other characters are shown as `?`.
 
 ## 📝 License
 Released under the [zlib license](LICENSE).
