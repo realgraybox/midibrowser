@@ -1,3 +1,4 @@
+<img width="812" height="436" alt="midibrowser" src="https://github.com/user-attachments/assets/ca035f56-11bd-4775-8294-a9ff727da713" />
 # MIDI DB Browser (midibrowser)
 
 A minimalist, ultra-fast, and resource-efficient database browser for large collections of MIDI files (or other datasets), built using **pure C and Xlib**.
