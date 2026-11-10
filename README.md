@@ -15,41 +15,77 @@ This tool is designed to handle hundreds of thousands of entries with zero lag. 
 
 ## 🛠 Prerequisites & Installation
 
-You need the X11 development libraries installed on your Linux system to compile the program.
+You need a C compiler and the X11 development library (libX11). No other libraries are used.
 
 ### 1. Install Dependencies
 **Ubuntu / Debian:**
 ```bash
-sudo apt install libx11-dev
+sudo apt install build-essential libx11-dev
 ```
 
 **Fedora / RHEL:**
 ```bash
-sudo apt install libX11-devel
+sudo dnf install gcc make libX11-devel
 ```
 
-### 2. Database Format
-The program expects a tab-separated text file named `midi_database_kompakt.txt` in the same directory. The format must consist of a unique key (such as an MD5 hash), followed by a tab character (`\t`), and one or more paths separated by semicolons:
+### 2. Compilation
+```bash
+make                              # build ./midibrowser
+make install                      # install to /usr/local/bin (PREFIX=/usr and DESTDIR= are supported)
+make STATIC=1                     # static build (default on i386 toolchains, e.g. uClibc)
+```
+On current glibc distributions a static libX11 also needs its dependencies:
+`make STATIC=1 LDLIBS="-lX11 -lxcb -lXau -lXdmcp"`.
+
+Without make: `gcc -Os midibrowser.c -o midibrowser -lX11`
+
+### 3. Data Layout
+The program is started from a data folder containing the database file, the MIDI files and (optionally) the playback script:
 
 ```text
-4945940cfd5f38c53f4d6c5f0beca203    beatles/Ob-La-Di_Ob-La-Da_2.mid; beatles/ob_la_di_ob_la_da.mid
-a28a1a84526d81b3d7f5cd679869449b    beatles/dont_ever_change.mid
+data/
+├── midi_database_kompakt.txt
+├── playmidi.sh
+├── 0/0a46edd11874a30a4315c683fbdf9dea.mid
+├── 1/1595531b64ef3487d0bab672c6d664d6.mid
+└── ...  (one folder per first hex character, 0-9 and a-f)
 ```
 
-### 3. Playback Script (`playmidi.sh`)
+Each MIDI file is stored as `<first character of key>/<key>.mid` (`.midi` or no extension are also accepted). This is the layout of the [Lakh MIDI Dataset](https://colinraffel.com/projects/lmd/) (`lmd_full`).
+
+### 4. Database Format
+`midi_database_kompakt.txt` is a plain text file with one record per line: a unique key (the file's MD5 hash), a **tab** character, and one or more original names separated by `; `. The names are what you search in; lines without a tab are ignored.
+
+```text
+4945940cfd5f38c53f4d6c5f0beca203	beatles/Ob-La-Di_Ob-La-Da_2.mid; beatles/ob_la_di_ob_la_da.mid
+a28a1a84526d81b3d7f5cd679869449b	beatles/dont_ever_change.mid
+```
+
+**From the Lakh MIDI Dataset** (`md5_to_paths.json`):
+```bash
+python3 -c 'import json,sys; [print(k+"\t"+"; ".join(v)) for k,v in json.load(open(sys.argv[1])).items()]' \
+    md5_to_paths.json > midi_database_kompakt.txt
+```
+
+**From your own folder of MIDI files** (copies each file into the layout above; duplicates are merged into one line):
+```bash
+SRC=~/midi    # your MIDI collection
+find "$SRC" -type f \( -iname '*.mid' -o -iname '*.midi' \) -print0 |
+while IFS= read -r -d '' f; do
+    h=$(md5sum "$f" | cut -c1-32)
+    mkdir -p "${h:0:1}" && cp "$f" "${h:0:1}/$h.mid"
+    printf '%s\t%s\n' "$h" "${f#$SRC/}"
+done | awk -F'\t' '{ if ($1 in a) a[$1] = a[$1] "; " $2; else a[$1] = $2 } END { for (k in a) print k "\t" a[k] }' \
+    > midi_database_kompakt.txt
+```
+
+### 5. Playback Script (`playmidi.sh`)
 Create a file named `playmidi.sh` in the directory you start the program from (or anywhere in your `$PATH`), make it executable (`chmod +x playmidi.sh`), and define your preferred playback command. A `./playmidi.sh` in the current directory takes precedence over one in `$PATH`. The script runs in its own process group, so stopping playback also stops a player the script starts without `exec`. For example:
 
 ```bash
 #!/bin/bash
 # Example using timidity
 exec timidity "$1"
-```
-
-### 4. Compilation
-Compile the program by linking the X11 library:
-
-```bash
-gcc midibrowser.c -o midibrowser -lX11
 ```
 
 ## 🎮 Shortcuts & Controls
@@ -67,7 +103,7 @@ gcc midibrowser.c -o midibrowser -lX11
 
 ## 🎨 Customization
 
-Colors and structural padding can easily be customized by tweaking the variables at the beginning of the `main()` function in `midibrowser.c`. The layout automatically recalculates the geometry on the next compilation.
+Colors, paddings and the font name are variables at the top of `midibrowser.c`. Change them and recompile; the layout is calculated from the font's size at startup.
 
 ## 📝 License
-This project is open-source. Feel free to use, modify, and distribute the code.
+Released under the [zlib license](LICENSE).
