@@ -13,6 +13,15 @@
 #include <signal.h>
 #include <errno.h>
 
+// Text: xbmfont (xbmfont/), bitmap fonts built into the program, so the browser
+// looks the same on every X server. 6x13 looks like X's own "fixed" font.
+#define XBMFONT_IMPLEMENTATION
+#include "xbmfont.h"
+#include "fonts/xbf_fixed_6x13.h"
+#ifndef MIDIBROWSER_SMALL_FONTS
+#include "fonts/xbf_fixed_10x20.h"   // sharper text on large screens (about 17 KB)
+#endif
+
 // One record = one line of the database file, stored once. The delimiters are
 // replaced by '\0', so column k is found by skipping k-1 strings.
 typedef struct {
@@ -36,8 +45,7 @@ static Display *dpy;
 static Window win;
 static GC gc;
 static Pixmap pixmap = 0;
-static XFontStruct *font_info = NULL;
-static int font_loaded = 0;     // 1 = XLoadQueryFont (XFreeFont), 0 = XQueryFont (XFreeFontInfo)
+static xbf_ctx *txt = NULL;     // text font, uploaded once to the X server
 
 // PID (and process group id) of the running player, 0 if none.
 // Written from the SIGCHLD handler, hence volatile.
@@ -73,25 +81,33 @@ static unsigned long col_selected_fg = 0xFFFFFF;
 static unsigned long col_bot_bg      = 0x2D3748;
 static unsigned long col_bot_fg      = 0xA0AEC0;
 
-// paddings
+// paddings (for the base size; they grow with the text on large screens)
 static int padding_top_bottom_bars = 4;  // padding over/under text in header and footer
 static int padding_rows            = 2;  // padding over/under text in db-view section
 static int padding_left            = 15; // left/right text margin
 
-// Fonts are tried in order. The first is the Unicode (iso10646) version of the
-// classic "fixed" font from xfonts-base; "fixed" (Latin-1) is the fallback.
-// For a larger font try "-misc-fixed-medium-r-normal--15-140-75-75-c-90-iso10646-1" (9x15).
-static const char *font_names[] = {
-    "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1",
-    "fixed",
+// Text sizes. The size follows the window (the largest whose scaled 800x600
+// layout fits), unless chosen with Ctrl + '+' / '-'; Ctrl + 0 goes back to auto.
+typedef struct { const xbf_font *font; int scale; } text_size;
+static const text_size sizes[] = {
+#ifndef MIDIBROWSER_SMALL_FONTS
+    { &xbf_fixed_6x13, 1 }, { &xbf_fixed_10x20, 1 }, { &xbf_fixed_6x13, 2 },
+    { &xbf_fixed_10x20, 2 }, { &xbf_fixed_10x20, 3 }, { &xbf_fixed_10x20, 4 },
+#else
+    { &xbf_fixed_6x13, 1 }, { &xbf_fixed_6x13, 2 }, { &xbf_fixed_6x13, 3 },
+    { &xbf_fixed_6x13, 4 }, { &xbf_fixed_6x13, 6 },
+#endif
 };
+#define N_SIZES ((int)(sizeof sizes / sizeof sizes[0]))
+static int size_now = -1;       // index in sizes
+static int size_manual = -1;    // chosen with Ctrl +/-, or -1 = follow the window
 
 // Dynamic layout sizes (calculated from font + padding)
-static int font_height = 0;
 static int font_ascent = 0;
 static int row_height = 0;
 static int header_height = 0;
 static int footer_height = 0;
+static int pad_bars = 0, pad_rows = 0, pad_left = 0;   // paddings at the current size
 
 static void set_window_icon(Display *mydpy, Window mywin) {
     // _NET_WM_ICON is an array of CARDINAL, which Xlib passes as 'long' on all platforms.
@@ -492,55 +508,48 @@ static void check_pixmap(void) {
     pixmap = XCreatePixmap(dpy, win, win_width, win_height, DefaultDepth(dpy, DefaultScreen(dpy)));
 }
 
-// Convert UTF-8 to the 16-bit characters used by XDrawString16. Characters
-// the font cannot have (above U+00FF for a Latin-1 font, above U+FFFF for
-// any core font) become '?'. Returns the number of characters.
-static int to_xchar2b(const char *text, XChar2b **buf, int *cap) {
-    int need = (int)strlen(text);   // never more characters than bytes
-    if (need > *cap) {
-        *cap = need + 64;
-        *buf = xrealloc(*buf, (size_t)*cap * sizeof(XChar2b));
-    }
-    int unicode_font = font_info->max_byte1 > 0;
-    int n = 0;
-    const unsigned char *p = (const unsigned char *)text;
-    while (*p) {
-        unsigned int cp = utf8_next(&p);
-        if (cp > 0xFFFF || (!unicode_font && cp > 0xFF)) cp = '?';
-        (*buf)[n].byte1 = (unsigned char)(cp >> 8);
-        (*buf)[n].byte2 = (unsigned char)(cp & 0xFF);
-        n++;
-    }
-    return n;
+// Draw UTF-8 text at (x, y) in colour `fg`, ending in an ellipsis if it is
+// wider than max_width pixels. Characters the font lacks are drawn as '?'.
+static void draw_text_fit(Drawable d, int x, int y, const char *text, int max_width,
+                          unsigned long fg) {
+    xbf_draw_fit(txt, d, x, y, fg, text, max_width, XBF_CUT_END);
 }
 
-// Draw UTF-8 text at (x, y), truncated with "..." so it fits in max_width pixels.
-// Measures with the real font, so it works for any font and any window width.
-static void draw_text_fit(Drawable d, int x, int y, const char *text, int max_width) {
-    static XChar2b *buf = NULL;
-    static int cap = 0;
-    static const XChar2b ellipsis[3] = { {0, '.'}, {0, '.'}, {0, '.'} };
+// A base-size measure at the current text size (13 px = base)
+static int scaled(int v) {
+    int line = sizes[size_now].font->height * sizes[size_now].scale;
+    return (v * line + 6) / 13;
+}
 
-    int len = to_xchar2b(text, &buf, &cap);
-    if (max_width <= 0 || len == 0) return;
+// Use text size i: upload its font and recalculate the layout. False if X
+// could not take the font (the current size is kept).
+static int set_size(int i) {
+    if (txt && i == size_now) return 1;
+    xbf_ctx *t = xbf_create(dpy, win, sizes[i].font, sizes[i].scale);
+    if (!t) return txt != NULL;
+    xbf_free(txt);
+    txt = t;
+    size_now = i;
 
-    if (XTextWidth16(font_info, buf, len) <= max_width) {
-        XDrawString16(dpy, d, gc, x, y, buf, len);
-        return;
+    pad_bars = scaled(padding_top_bottom_bars);
+    pad_rows = scaled(padding_rows);
+    pad_left = scaled(padding_left);
+    font_ascent   = xbf_ascent(txt);
+    row_height    = xbf_line_height(txt) + (pad_rows * 2);
+    header_height = xbf_line_height(txt) + (pad_bars * 2);
+    footer_height = xbf_line_height(txt) + (pad_bars * 2);
+    return 1;
+}
+
+// The size to use now: the chosen one, or the largest that fits the window
+static int wanted_size(void) {
+    if (size_manual >= 0) return size_manual;
+    int best = 0;
+    for (int i = 1; i < N_SIZES; i++) {
+        int line = sizes[i].font->height * sizes[i].scale;
+        if (line * 800 <= win_width * 13 && line * 600 <= win_height * 13) best = i;
     }
-
-    int avail = max_width - XTextWidth16(font_info, ellipsis, 3);
-    if (avail <= 0) return;   // not even room for "..."
-
-    // Binary search for the longest prefix that fits.
-    int lo = 0, hi = len;
-    while (lo < hi) {
-        int mid = (lo + hi + 1) / 2;
-        if (XTextWidth16(font_info, buf, mid) <= avail) lo = mid;
-        else hi = mid - 1;
-    }
-    XDrawString16(dpy, d, gc, x, y, buf, lo);
-    XDrawString16(dpy, d, gc, x + XTextWidth16(font_info, buf, lo), y, ellipsis, 3);
+    return best;
 }
 
 static void draw_ui(void) {
@@ -548,7 +557,7 @@ static void draw_ui(void) {
     static size_t row_cap = 0;
     if (!pixmap) return;
 
-    int text_width = win_width - 2 * padding_left;
+    int text_width = win_width - 2 * pad_left;
 
     // 1. Clear pixmap with the list background colour
     XSetForeground(dpy, gc, col_mid_bg);
@@ -564,35 +573,31 @@ static void draw_ui(void) {
         if (current_idx == selected_index) {
             XSetForeground(dpy, gc, col_selected_bg);
             XFillRectangle(dpy, pixmap, gc, 0, y_pos, win_width, row_height);
-            XSetForeground(dpy, gc, col_selected_fg);
-        } else {
-            XSetForeground(dpy, gc, col_mid_fg);
         }
 
         const Entry *e = &database[filtered_indices[current_idx]];
-        draw_text_fit(pixmap, padding_left, y_pos + padding_rows + font_ascent,
-                      expand(opt_show, e, &row_buf, &row_cap), text_width);
+        draw_text_fit(pixmap, pad_left, y_pos + pad_rows + font_ascent,
+                      expand(opt_show, e, &row_buf, &row_cap), text_width,
+                      current_idx == selected_index ? col_selected_fg : col_mid_fg);
     }
 
     // 2. Search bar (top)
     XSetForeground(dpy, gc, col_top_bg);
     XFillRectangle(dpy, pixmap, gc, 0, 0, win_width, header_height);
-    XSetForeground(dpy, gc, col_top_fg);
     char search_label[600];
     snprintf(search_label, sizeof(search_label), "Search: %s_", search_query);
-    draw_text_fit(pixmap, padding_left, padding_top_bottom_bars + font_ascent, search_label, text_width);
+    draw_text_fit(pixmap, pad_left, pad_bars + font_ascent, search_label, text_width, col_top_fg);
 
     // 3. Status bar (bottom)
     int footer_y = win_height - footer_height;
     XSetForeground(dpy, gc, col_bot_bg);
     XFillRectangle(dpy, pixmap, gc, 0, footer_y, win_width, footer_height);
-    XSetForeground(dpy, gc, col_bot_fg);
     char status_text[256];
     snprintf(status_text, sizeof(status_text),
-             opt_keep ? "Found: %d/%d  |  [Enter/Click]: %s  |  [ESC]: Quit"
-                      : "Found: %d/%d  |  [Enter/Click]: %s  |  [Ctrl]: Stop  |  [ESC]: Quit",
+             opt_keep ? "Found: %d/%d  |  [Enter/Click]: %s  |  [Ctrl +/-]: Size  |  [ESC]: Quit"
+                      : "Found: %d/%d  |  [Enter/Click]: %s  |  [Ctrl]: Stop  |  [Ctrl +/-]: Size  |  [ESC]: Quit",
              filtered_count, db_count, opt_action);
-    draw_text_fit(pixmap, padding_left, footer_y + padding_top_bottom_bars + font_ascent, status_text, text_width);
+    draw_text_fit(pixmap, pad_left, footer_y + pad_bars + font_ascent, status_text, text_width, col_bot_fg);
 
     // 4. Copy pixmap to the window
     XCopyArea(dpy, pixmap, win, gc, 0, 0, win_width, win_height, 0, 0);
@@ -707,7 +712,7 @@ int main(int argc, char **argv) {
 
     XSetWindowBackgroundPixmap(dpy, win, None);
 
-    XSelectInput(dpy, win, ExposureMask | KeyPressMask | ButtonPressMask | StructureNotifyMask);
+    XSelectInput(dpy, win, ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask | StructureNotifyMask);
     set_window_icon(dpy, win);
 
     // Handle the window manager's close button (X) ourselves
@@ -725,29 +730,12 @@ int main(int argc, char **argv) {
 
     gc = XCreateGC(dpy, win, 0, NULL);
 
-    // Load the first available font and retrieve its metrics.
-    for (size_t i = 0; i < sizeof(font_names) / sizeof(font_names[0]) && !font_info; i++)
-        font_info = XLoadQueryFont(dpy, font_names[i]);
-    if (font_info) {
-        font_loaded = 1;
-        XSetFont(dpy, gc, font_info->fid);
-        if (font_info->max_byte1 == 0)
-            fprintf(stderr, "Using a Latin-1 font: characters above U+00FF are shown as '?'.\n");
-    } else {
-        fprintf(stderr, "Could not load any configured font, falling back to the default.\n");
-        font_info = XQueryFont(dpy, XGContextFromGC(gc));
-        if (!font_info) {
-            fprintf(stderr, "Could not query the default font.\n");
-            return 1;
-        }
+    // Upload the text font for the window size and calculate the layout.
+    if (!set_size(wanted_size())) {
+        fprintf(stderr, "Could not upload the font to the X server.\n");
+        return 1;
     }
-
-    // Dynamic layout calculation (based on the font)
-    font_ascent   = font_info->ascent;
-    font_height   = font_info->ascent + font_info->descent;
-    row_height    = font_height + (padding_rows * 2);
-    header_height = font_height + (padding_top_bottom_bars * 2);
-    footer_height = font_height + (padding_top_bottom_bars * 2);
+    int ctrl_alone = 0;   // Ctrl is down and no other key was pressed with it
 
     check_pixmap();
 
@@ -767,6 +755,7 @@ int main(int argc, char **argv) {
             if (event.xconfigure.width != win_width || event.xconfigure.height != win_height) {
                 win_width = event.xconfigure.width;
                 win_height = event.xconfigure.height;
+                set_size(wanted_size());
                 check_pixmap();
                 ensure_visible();
                 draw_ui();
@@ -787,12 +776,28 @@ int main(int argc, char **argv) {
             int len = (int)strlen(search_query);
 
             if (keysym == XK_Control_L || keysym == XK_Control_R) {
-                if (!opt_keep && current_player_pid) {
-                    stop_player();
-                    printf("Stopped via CTRL.\n");
+                ctrl_alone = 1;    // stops the player when released (below)
+                break;
+            }
+            ctrl_alone = 0;        // Ctrl + key: not the stop key
+            if (event.xkey.state & ControlMask) {
+                // Ctrl + '+' / '-': bigger / smaller text; Ctrl + 0: follow the window
+                int s = -2;
+                if (keysym == XK_plus || keysym == XK_equal || keysym == XK_KP_Add)
+                    s = size_now < N_SIZES - 1 ? size_now + 1 : size_now;
+                else if (keysym == XK_minus || keysym == XK_KP_Subtract)
+                    s = size_now > 0 ? size_now - 1 : 0;
+                else if (keysym == XK_0 || keysym == XK_KP_0 || keysym == XK_KP_Insert)
+                    s = -1;
+                if (s != -2) {
+                    size_manual = s;
+                    set_size(wanted_size());
+                    ensure_visible();
+                    draw_ui();
+                    break;
                 }
             }
-            else if (keysym == XK_Escape) {
+            if (keysym == XK_Escape) {
                 running = 0;
             }
             else if (keysym == XK_Up) {
@@ -847,8 +852,21 @@ int main(int argc, char **argv) {
             break;
         }
 
+        case KeyRelease:
+            // Ctrl pressed and released on its own stops the player
+            if (ctrl_alone && (XLookupKeysym(&event.xkey, 0) == XK_Control_L ||
+                               XLookupKeysym(&event.xkey, 0) == XK_Control_R)) {
+                ctrl_alone = 0;
+                if (!opt_keep && current_player_pid) {
+                    stop_player();
+                    printf("Stopped via CTRL.\n");
+                }
+            }
+            break;
+
         case ButtonPress: {
             int mouse_y = event.xbutton.y;
+            ctrl_alone = 0;
             int rows = visible_rows();
             if (event.xbutton.button == 1) {
                 // Click within the drawn rows of the central area
@@ -881,8 +899,7 @@ int main(int argc, char **argv) {
 
     if (!opt_keep) stop_player();
     if (pixmap) XFreePixmap(dpy, pixmap);
-    if (font_loaded) XFreeFont(dpy, font_info);
-    else XFreeFontInfo(NULL, font_info, 1);
+    xbf_free(txt);
     XFreeGC(dpy, gc);
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);

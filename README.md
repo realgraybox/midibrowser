@@ -9,10 +9,10 @@ This tool is designed to handle hundreds of thousands of entries with zero lag. 
 
 - **Instantaneous Search:** Filters through over 170,000 data rows in less than 2 milliseconds as you type.
 - **Double Buffering (Pixmap):** All drawing operations are performed off-screen first, ensuring a 100% flicker-free experience—even during window resizing.
-- **Dynamic UI Scaling:** The layout, bars, and click zones automatically adapt to the window dimensions and the system font (padding and spacing are calculated dynamically based on font metrics).
+- **Dynamic UI Scaling:** The layout, bars, and click zones automatically adapt to the window dimensions. On a large screen the text, rows and paddings grow with the window; Ctrl + `+` / `-` makes them bigger or smaller, Ctrl + `0` follows the window again.
 - **Decoupled Player Control:** Forwards the selected entry to an external program (by default `playmidi.sh`), so you can swap playback engines (e.g., Timidity, aplaymidi) without recompiling.
 - **General Purpose:** Command line options choose the file, delimiter, columns to search and show, and the program to run, so one binary can browse several collections at once (see Options below).
-- **International Characters:** File names are UTF-8 (Latin-1 lines are converted when loading). You can type and search for letters such as æ, ø and å, case-insensitively (Æ finds æ). This uses only core X11 fonts, so no extra libraries are needed.
+- **International Characters:** File names are UTF-8 (Latin-1 lines are converted when loading). You can type and search for letters such as æ, ø and å, case-insensitively (Æ finds æ). Text is drawn with fonts built into the program ([xbmfont](https://github.com/realgraybox/xbmfont), bundled in `xbmfont/`), so it looks the same on every X server and no font packages are needed. They have the Latin letters of Western and Central Europe (æ ø å, ä ö ü, é, ř ł ő š ...), curly quotes, dashes and "…"; other characters (e.g. Cyrillic, Greek, CJK) are shown as `?`. Lines that are not UTF-8 are read as Windows-1252.
 - **Keyboard & Mouse Navigation:** Full support for arrow keys, mouse wheel scrolling, and instant selection via mouse clicks.
 
 ## 🛠 Prerequisites & Installation
@@ -35,11 +35,12 @@ sudo dnf install gcc make libX11-devel
 make                              # build ./midibrowser
 make install                      # install to /usr/local/bin (PREFIX=/usr and DESTDIR= are supported)
 make STATIC=1                     # static build (default on i386 toolchains, e.g. uClibc)
+make SMALL_FONTS=1                # only the 6x13 font (scaled on large screens), about 17 KB smaller
 ```
 On current glibc distributions a static libX11 also needs its dependencies:
 `make STATIC=1 LDLIBS="-lX11 -lxcb -lXau -lXdmcp"`.
 
-Without make: `gcc -Os midibrowser.c -o midibrowser -lX11`
+Without make: `gcc -Os -I./xbmfont midibrowser.c -o midibrowser -lX11`
 
 ### 3. Data Layout
 The program is started from a data folder containing the database file, the MIDI files and (optionally) the playback script:
@@ -104,7 +105,7 @@ Without options the program works as described above. Options make it a browser 
 | `-x COMMAND` | Program to run, may include options, e.g. `'aplay -q'` | `./playmidi.sh` or `playmidi.sh` from `$PATH` |
 | `-T TITLE` | Window title | `MIDI DB Browser` |
 | `-a LABEL` | Action shown in the status bar, e.g. `View` | `Play` |
-| `-k` | Keep programs running: don't stop the previous one when starting a new one; Ctrl does nothing | off |
+| `-k` | Keep programs running: don't stop the previous one when starting a new one; Ctrl on its own does nothing | off |
 
 - **Templates:** `{N}` is the value of column N (columns are numbered from 1), and `{N:K}` its first K characters. Other text is copied as is. A missing column is empty.
 - **One-column files** (a plain list such as the output of `find`) are shown, searched and passed to the command as they are, with no options needed.
@@ -152,16 +153,18 @@ Run `midibrowser -h` for a short summary of the options.
 | **BackSpace** | Delete characters in the search query |
 | **Arrow Up / Down** | Navigate up and down the filtered list |
 | **Enter** | Play / run the command for the selected entry (stops the previous one, unless `-k`) |
-| **Left or Right CTRL** | Stop the running program immediately (not with `-k`) |
+| **Left or Right CTRL** | Stop the running program (pressed and released on its own; not with `-k`) |
+| **CTRL + `+` / `-`** | Bigger / smaller text (also keypad + / -) |
+| **CTRL + `0`** | Text size follows the window again (default) |
 | **ESC** | Quit; stops the running program (programs started with `-k` keep running) |
 | **Left Mouse Click** | Select and play / run an entry instantly |
 | **Mouse Scroll Wheel** | Scroll rapidly up and down through the list |
 
 ## 🎨 Customization
 
-Colors, paddings and the font list are variables at the top of `midibrowser.c`. Change them and recompile; the layout is calculated from the font's size at startup.
+Colors, paddings and the text sizes are variables at the top of `midibrowser.c`. Change them and recompile; the layout is calculated from the font's size.
 
-By default the Unicode version of the classic `fixed` font is used (`-misc-fixed-...-iso10646-1`, from the `xfonts-base` package). If it isn't installed, the plain `fixed` font is used: letters from Western European languages (Latin-1) still display correctly, and other characters are shown as `?`.
+The base size is the 6x13 font, which looks like X's own `fixed` font. Larger windows get 10x20, then both doubled, tripled ... (the largest size whose scaled 800x600 layout fits the window).
 
 ## 📝 License
-Released under the [zlib license](LICENSE).
+Released under the [zlib license](LICENSE). The bundled xbmfont is zlib licensed (`xbmfont/LICENSE`); its fonts are the public-domain X11 misc-fixed fonts.
